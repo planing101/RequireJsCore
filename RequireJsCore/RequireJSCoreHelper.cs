@@ -1,0 +1,166 @@
+﻿using Microsoft.AspNetCore.Html;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using RequireJsCore.Configuration;
+using RequireJsCore.Helpers;
+using RequireJsCore.Models;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace RequireJsCore
+{
+    public static class RequireJsCoreHelper
+    {
+        public static HtmlString RenderRequireJsSetup(this IHtmlHelper html, RequireRendererConfiguration config)
+        {
+            try
+            {
+                if (config == null)
+                {
+                    throw new ArgumentNullException("config");
+                }
+
+                var entryPointPath = html.RequireJsEntryPoint(config);
+
+                if (entryPointPath == null)
+                {
+                    return new HtmlString("EntryPointPath not set.");
+                }
+
+                if (config.ConfigurationFiles == null || !config.ConfigurationFiles.Any())
+                {
+                    throw new Exception("No config files to load.");
+                }
+
+                var processedConfigs = config.ConfigurationFiles.Select(r =>
+                {
+                    var resultingPath = html.ViewContext.MapPath(r);
+                    PathHelpers.VerifyFileExists(resultingPath);
+                    return resultingPath;
+                }).ToList();
+
+                var resultingConfig = GetCachedOverridenConfig(processedConfigs, config, entryPointPath.ToString());
+
+                var locale = config.LocaleSelector(html);
+
+                var outputConfig = createOutputConfigFrom(resultingConfig, config, locale);
+
+                var options = createOptionsFrom(html.ViewContext.HttpContext, config, locale);
+
+                var configBuilder = new JavascriptBuilder();
+                configBuilder.AddStatement(JavascriptHelper.SerializeAsVariable(options, "requireConfig"));
+                configBuilder.AddStatement(JavascriptHelper.SerializeAsVariable(outputConfig, "require"));
+
+                return new HtmlString(configBuilder.Render());
+
+            }
+            catch (Exception ex)
+            {
+                return new HtmlString(ex.Message);
+            }
+        }
+
+        internal static JsonRequireOptions createOptionsFrom(HttpContext httpContext, RequireRendererConfiguration config, string locale)
+        {
+            var options = new JsonRequireOptions
+            {
+                Locale = locale,
+                PageOptions = RequireJsOptions.GetPageOptions(httpContext),
+                WebsiteOptions = RequireJsOptions.GetGlobalOptions(httpContext)
+            };
+
+            config.ProcessOptions(options);
+            return options;
+        }
+
+        internal static JsonRequireOutput createOutputConfigFrom(ConfigurationCollection resultingConfig, RequireRendererConfiguration config, string locale)
+        {
+            var outputConfig = new JsonRequireOutput
+            {
+                BaseUrl = config.BaseUrl,
+                Locale = locale,
+                UrlArgs = config.UrlArgs,
+                WaitSeconds = config.WaitSeconds,
+                Paths = resultingConfig.Paths.PathList.ToDictionary(r => r.Key, r => r.Value),
+                Packages = resultingConfig.Packages.PackageList,
+                Shim = resultingConfig.Shim.ShimEntries.ToDictionary(
+                        r => r.For,
+                        r => new JsonRequireDeps
+                        {
+                            Dependencies = r.Dependencies.Select(x => x.Dependency).ToList(),
+                            Exports = r.Exports
+                        }),
+                Map = resultingConfig.Map.MapElements.ToDictionary(
+                         r => r.For,
+                         r => r.Replacements.ToDictionary(x => x.OldKey, x => x.NewKey))
+            };
+
+            config.ProcessConfig(outputConfig);
+
+            return outputConfig;
+        }
+
+        private static HashStore<ConfigurationCollection> configObjectHash = new HashStore<ConfigurationCollection>();
+
+        private static ConfigurationCollection GetCachedOverridenConfig(
+            List<string> processedConfigs,
+            RequireRendererConfiguration config,
+            string entryPointPath)
+        {
+            if (config.CacheConfigObject)
+            {
+                return configObjectHash.GetOrSet(
+                    ComputeConfigObjectHash(processedConfigs, entryPointPath),
+                    () => GetOverridenConfig(processedConfigs, config, entryPointPath));
+            }
+
+            return GetOverridenConfig(processedConfigs, config, entryPointPath);
+        }
+
+        private static string ComputeConfigObjectHash(List<string> processedConfigs, string entryPointPath)
+        {
+            return string.Join("|", processedConfigs) + "|" + entryPointPath;
+        }
+
+        private static ConfigurationCollection GetOverridenConfig(
+            List<string> processedConfigs,
+            RequireRendererConfiguration config,
+            string entryPointPath)
+        {
+            var loader = new ConfigLoader(
+                processedConfigs,
+                config.Logger,
+                new ConfigLoaderOptions
+                {
+                    LoadOverrides = config.LoadOverrides,
+                    CachingPolicy = config.ConfigCachingPolicy
+                });
+            var resultingConfig = loader.Get();
+
+            var overrider = new ConfigOverrider();
+            overrider.Override(resultingConfig, entryPointPath.ToModuleName());
+
+            return resultingConfig;
+        }
+
+        /// <summary>
+        /// Returns entry point script relative path
+        /// </summary>
+        /// <param name="html">
+        /// The HtmlHelper instance.
+        /// </param>
+        /// <param name="root">
+        /// Relative root path ex. ~/Scripts/
+        /// </param>
+        /// <returns>
+        /// The <see cref="MvcHtmlString"/>.
+        /// </returns>
+        public static HtmlString RequireJsEntryPoint(this IHtmlHelper html, RequireRendererConfiguration config)
+        {
+            var result = RequireJsOptions.ResolverCollection.Resolve(html.ViewContext, config);
+
+            return result != null ? new HtmlString(result) : null;
+        }
+    }
+}
